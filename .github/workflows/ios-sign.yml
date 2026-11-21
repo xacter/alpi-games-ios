@@ -1,0 +1,155 @@
+name: iOS imzala ve yükle (hazır Xcode projesi)
+
+# Sunucuda (Linux, lisanslı Unity) üretilen Xcode projesini GitHub sürüm ekinden alır, App Store Connect API
+# anahtarıyla otomatik (bulut) imzalar, IPA'yı dışa aktarır ve isteğe bağlı olarak App Store Connect'e yükler.
+# Sürüm etiketi: <oyun>-<sürüm>-<build>, ör. feedingtime-1.0.0-1. Ek: ios-xcode*.tar.gz (kökte Unity-iPhone.xcodeproj).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Xcode projesinin ekli olduğu sürüm etiketi (ör. feedingtime-1.0.0-1)"
+        required: true
+      upload:
+        description: "IPA App Store Connect'e (TestFlight) yüklensin mi?"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-sign-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    name: Arşivle, imzala, yükle (macOS)
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Sırları denetle
+        run: |
+          for name in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            if [ -z "${!name}" ]; then echo "::error::Sır eksik: $name"; exit 1; fi
+          done
+          xcodebuild -version
+
+      - name: Xcode projesini indir ve aç
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" -p 'ios-xcode*.tar.gz' -D "$RUNNER_TEMP/dl"
+          tarball="$(ls "$RUNNER_TEMP"/dl/ios-xcode*.tar.gz | head -n1)"
+          mkdir -p "$RUNNER_TEMP/xcode"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/xcode"
+          cd "$RUNNER_TEMP/xcode"
+          test -d Unity-iPhone.xcodeproj || { echo "::error::Unity-iPhone.xcodeproj yok"; ls -la; exit 1; }
+          find . -type f \( -name '*.sh' -o -name '*.py' -o -name 'MapFileParser' -o -name 'usymtool' -o -name 'il2cpp' \) -exec chmod +x {} + || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Info.plist || true
+          plutil -p Info.plist | grep -E 'CFBundle(ShortVersionString|Version|DisplayName)' || true
+          xcodebuild -list -project Unity-iPhone.xcodeproj
+
+      # ASC_KEY_P8 düz metin (-----BEGIN PRIVATE KEY----- ile başlayan) ya da base64 olabilir
+      - name: App Store Connect API anahtarını yaz
+        run: |
+          set -euo pipefail
+          keydir="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$keydir"
+          key="$keydir/AuthKey_${ASC_KEY_ID}.p8"
+          if printf '%s' "$ASC_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s\n' "$ASC_KEY_P8" > "$key"
+          else
+            printf '%s' "$ASC_KEY_P8" | openssl base64 -d -A > "$key"
+          fi
+          chmod 600 "$key"
+          grep -q 'BEGIN PRIVATE KEY' "$key" || { echo "::error::ASC_KEY_P8 çözülemedi"; exit 1; }
+          echo "ASC_KEY_PATH=$key" >> "$GITHUB_ENV"
+
+      - name: Arşivle (otomatik imza)
+        working-directory: ${{ runner.temp }}/xcode
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            > "$RUNNER_TEMP/archive.log" 2>&1 || {
+              grep -E "error:|warning: .*signing|Code Signing|No profiles|requires a provisioning" "$RUNNER_TEMP/archive.log" | head -n 60
+              tail -n 120 "$RUNNER_TEMP/archive.log"; exit 1; }
+          tail -n 20 "$RUNNER_TEMP/archive.log"
+
+      - name: IPA'yı dışa aktar (app-store-connect)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>stripSwiftSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ipa="$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' -print -quit)"
+          if [ -z "$ipa" ]; then echo "::error::IPA üretilmedi"; ls -la "$RUNNER_TEMP/export"; exit 1; fi
+          echo "IPA_PATH=$ipa" >> "$GITHUB_ENV"
+          ls -lh "$ipa"
+          shasum -a 256 "$ipa"
+
+      - name: IPA'yı artifact olarak sakla
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ inputs.release_tag }}
+          path: ${{ env.IPA_PATH }}
+          retention-days: 14
+          compression-level: 0
+
+      - name: App Store Connect'e yükle
+        if: ${{ inputs.upload }}
+        run: |
+          set -euo pipefail
+          xcrun altool --upload-app --type ios --file "$IPA_PATH" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Arşiv günlüğünü sakla (hata ayıklama)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-sign-logs-${{ inputs.release_tag }}
+          path: ${{ runner.temp }}/archive.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Anahtarı sil
+        if: ${{ always() }}
+        run: rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
